@@ -160,6 +160,25 @@ BF16 weight into a `dist_moe.PreparedWeight`:
 The two scale layouts differ because the contraction axis differs. Sharing the
 qdata does not make the scales interchangeable.
 
+An external quantizer can instead call `import_block_scaled_weight` with
+independent FPROP and DGRAD E4M3 data. Both use the same logical `[E, N, K]`
+shape; DGRAD consumers perform the transpose. Their blocked E8M0 scale tensors
+have shapes `[E*N, K/32]` and `[E*K, N/32]` respectively. N and K must be
+divisible by 128. Independent one-dimensional quantization is supported;
+import does not impose preparation's shared 32x32 quantization values.
+
+Import validates metadata and aliases the supplied storage without launching
+quantization or allocating a high-precision shadow. Its logical source may be
+a tensor wrapper. The external owner retains and refreshes all operands;
+`prepare_block_scaled_weight(..., out=imported)` is rejected. Changes must wait
+until every forward/backward consumer has finished. See the public factory
+docstring for the exact dtype, contiguity, and alignment contract.
+
+[Explicit execution](functional_execution.md) accepts these same prepared
+operands and uses the registered accumulating backward with caller-owned
+weight-gradient destinations. Parameter ownership and completion remain outside
+the package.
+
 Prepared execution consumes the quantized operands, not the logical source's
 data. The source retains its shape, dtype and gradient identity but need not
 have readable storage, including during training-context `torch.no_grad()`

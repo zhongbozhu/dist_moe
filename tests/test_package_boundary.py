@@ -54,9 +54,11 @@ _EXPECTED_ROOT_EXPORTS = frozenset(
         "ExecutionOptions",
         "MemoryPlan",
         "PreparedWeight",
+        "functional",
         "RMSNormPostprocess",
         "VmmConfig",
         "plan_memory",
+        "import_block_scaled_weight",
         "prepare_block_scaled_weight",
         "routed_experts",
         "supports_fused_post_expert_rmsnorm",
@@ -132,7 +134,7 @@ class StaticPackageBoundaryTest(unittest.TestCase):
         exports = exported_names("__init__.py")
         api_exports = exported_names("api.py")
         self.assertEqual(exports, _EXPECTED_ROOT_EXPORTS)
-        self.assertEqual(exports, api_exports)
+        self.assertEqual(exports, api_exports | {"functional"})
         readme = (_PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
         api_table = readme.split("## Public API", 1)[1].split("\n## ", 1)[0]
         linked_exports = {

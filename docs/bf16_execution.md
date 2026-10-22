@@ -380,6 +380,12 @@ both existing `parameter.grad` tensors explicitly. See
 [WGRAD accumulation](wgrad_accumulation.md) for ownership and graph-capture
 requirements.
 
+[Explicit execution](functional_execution.md) uses that same accumulating math
+with two caller-owned destinations, including the first microbatch. Its forward
+returns detached output and opaque state; backward returns input/router gradients
+and updates external weight gradients directly. Parameter hooks, zeroing,
+reductions, and optimizer ownership remain with the caller.
+
 <a id="framework-integration"></a>
 ## Framework integration
 

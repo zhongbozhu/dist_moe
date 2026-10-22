@@ -8,6 +8,7 @@
 
 import dataclasses
 import datetime
+import itertools
 import tempfile
 import unittest
 from functools import partial, wraps
@@ -176,6 +177,75 @@ class _BackwardOpRecorder(TorchDispatchMode):
         return result
 
 
+def _assert_functional_graph(
+    test: unittest.TestCase,
+    context: dist_moe.Context,
+    inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    weights: tuple,
+    dy: torch.Tensor,
+    reference: tuple[torch.Tensor, ...],
+) -> None:
+    """Compare explicit capture/replay with native math and changed eager inputs.
+
+    Exact output/DGRAD/score comparisons protect replay operands. Nonzero FP32
+    buffers accumulate two contributions within a 1e-5 tolerance, and their
+    addresses remain fixed. Metadata remains readable after consuming state.
+    """
+    destinations = tuple(torch.zeros_like(value) for value in reference[3:])
+    pointers = tuple(value.data_ptr() for value in destinations)
+
+    def run():
+        """Execute one complete explicit contribution into stable destinations."""
+        y, state = dist_moe.functional.forward(*inputs, *weights, context)
+        dx, dscores = dist_moe.functional.backward(
+            state, dy, grad_w13=destinations[0], grad_w2=destinations[1]
+        )
+        return (y, dx, dscores), state
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run()
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        actual, state = run()
+    for value in destinations:
+        value.fill_(0.125)
+    graph.replay()
+    graph.replay()
+    torch.cuda.synchronize()
+    for value, target in zip(actual, reference[:3], strict=True):
+        torch.testing.assert_close(value, target, rtol=0, atol=0)
+    for value, target in zip(destinations, reference[3:], strict=True):
+        torch.testing.assert_close(value, 0.125 + 2 * target, rtol=1e-5, atol=1e-5)
+    test.assertEqual(tuple(value.data_ptr() for value in destinations), pointers)
+    test.assertIs(state.metadata["need_recompute"].dtype, torch.bool)
+    test.assertEqual(
+        state.metadata["padded_receive_rows"].numel(), dist.get_world_size()
+    )
+
+    original_x, original_dy = inputs[0].clone(), dy.clone()
+    with torch.no_grad():
+        inputs[0].mul_(0.9375)
+        dy.mul_(1.0625)
+    for value in destinations:
+        value.zero_()
+    changed, _ = run()
+    changed = tuple(value.clone() for value in (*changed, *destinations))
+    for value in destinations:
+        value.zero_()
+    graph.replay()
+    torch.cuda.synchronize()
+    for value, target in zip((*actual, *destinations), changed, strict=True):
+        torch.testing.assert_close(value, target, rtol=0, atol=0)
+    with torch.no_grad():
+        inputs[0].copy_(original_x)
+        dy.copy_(original_dy)
+    del graph
+
+
 def _reference_moe(
     x: torch.Tensor,
     topk_ids: torch.Tensor,
@@ -334,6 +404,93 @@ def _blockscaled_tolerance(
 
 class DistMoeConfigTest(unittest.TestCase):
     """CPU validation tests for the public configuration surface."""
+
+    def test_functional_execution_policy(self) -> None:
+        """The explicit API rejects implicit gradient ownership before execution."""
+        tensors = (torch.empty(2),) * 5
+        for options in (
+            dist_moe.ExecutionOptions(inplace_wgrad_accum=True),
+            dist_moe.ExecutionOptions(weights_preprocess_fn=lambda value: value),
+            dist_moe.ExecutionOptions(wgrad_destination_fn=lambda *args: None),
+        ):
+            with (
+                self.subTest(options=options),
+                mock.patch.object(
+                    api_impl,
+                    "_prepare_execution_inputs",
+                    return_value=(options, *tensors[:2]),
+                ),
+                self.assertRaisesRegex(ValueError, "callbacks or parameter gradients"),
+            ):
+                dist_moe.functional.forward(*tensors, object())
+        with self.assertRaisesRegex(TypeError, "save_for_backward must be bool"):
+            dist_moe.functional.forward(*tensors, object(), save_for_backward=1)
+        with self.assertRaisesRegex(TypeError, "created by functional.forward"):
+            dist_moe.functional.ForwardState()
+        with self.assertRaisesRegex(TypeError, "state must come"):
+            dist_moe.functional.backward(
+                None, tensors[0], grad_w13=tensors[0], grad_w2=tensors[0]
+            )
+        self.assertFalse(hasattr(dist_moe, "WgradIntegration"))
+
+    def test_imported_mxfp8_metadata_and_ownership(self) -> None:
+        """Import aliases independent directions and rejects invalid metadata/refill."""
+        with FakeTensorMode():
+            source = torch.empty((2, 256, 128), device="cuda", dtype=torch.bfloat16)
+            arguments = dict(
+                source=source,
+                format=dist_moe.BlockScaledFormat.MXFP8_E4M3,
+                fprop_data=torch.empty_like(source, dtype=torch.float8_e4m3fn),
+                dgrad_data=torch.empty_like(source, dtype=torch.float8_e4m3fn),
+                fprop_scale=torch.empty(
+                    (512, 4), device="cuda", dtype=torch.float8_e8m0fnu
+                ),
+                dgrad_scale=torch.empty(
+                    (256, 8), device="cuda", dtype=torch.float8_e8m0fnu
+                ),
+            )
+            prepared = dist_moe.import_block_scaled_weight(**arguments)
+            for name, value in arguments.items():
+                self.assertIs(getattr(prepared, name), value)
+            self.assertEqual(len(prepared.storage_tensors()), 4)
+            for replacement in (
+                {"dgrad_data": arguments["dgrad_data"].transpose(1, 2)},
+                {"fprop_scale": arguments["fprop_scale"].view(-1)},
+                {"dgrad_scale": arguments["dgrad_scale"].view(torch.uint8)},
+                {"format": dist_moe.BlockScaledFormat.NVFP4},
+            ):
+                with (
+                    self.subTest(replacement=replacement),
+                    self.assertRaises(ValueError),
+                ):
+                    dist_moe.import_block_scaled_weight(**(arguments | replacement))
+            with self.assertRaisesRegex(ValueError, "externally imported"):
+                dist_moe.prepare_block_scaled_weight(
+                    source, dist_moe.BlockScaledConfig(), out=prepared
+                )
+
+    def test_functional_no_retention_has_no_autograd_edges(self) -> None:
+        """Explicit no-retention forward disables autograd even for trainable inputs."""
+        x = torch.ones(2, requires_grad=True)
+        options = dist_moe.ExecutionOptions()
+        with (
+            mock.patch.object(
+                api_impl, "_prepare_execution_inputs", return_value=(options, x, x)
+            ),
+            mock.patch.object(
+                api_impl, "routed_experts", side_effect=lambda *args, **kwargs: x * 2
+            ),
+        ):
+            output, state = dist_moe.functional.forward(
+                x, x, x, x, x, object(), save_for_backward=False
+            )
+        self.assertIsNone(state)
+        self.assertFalse(output.requires_grad)
+        torch.testing.assert_close(output, torch.full_like(x, 2))
+        consumed = object.__new__(dist_moe.functional.ForwardState)
+        consumed._consumed = True
+        with self.assertRaisesRegex(RuntimeError, "consumes each state once"):
+            dist_moe.functional.backward(consumed, x, grad_w13=x, grad_w2=x)
 
     def test_resource_owner_types_are_factory_only(self) -> None:
         """Factory-owned resource types reject incomplete construction."""
@@ -1513,6 +1670,45 @@ class DistMoeBufferTest(unittest.TestCase):
 class DistMoeKernelTest(unittest.TestCase):
     """Numerical tests for CuTe grouped GEMM and distributed MoE."""
 
+    def test_external_wgrad_validates_both_destinations_before_writes(self) -> None:
+        """Wrong metadata and partial storage aliases fail without output mutation."""
+        from dist_moe._execution import _validate_external_wgrad_destinations
+
+        owners = tuple(
+            torch.nn.Parameter(
+                torch.zeros((1, 128, 128), device="cuda", dtype=torch.bfloat16)
+            )
+            for _ in range(2)
+        )
+        outputs = tuple(torch.ones_like(owner, dtype=torch.float32) for owner in owners)
+        weights = tuple(owner.detach() for owner in owners)
+        shared = torch.ones(128 * 128 + 128, device="cuda")
+        overlapping = (
+            shared[:-128].view_as(outputs[0]),
+            shared[128:].view_as(outputs[1]),
+        )
+        for destinations in (
+            (outputs[0], outputs[1].view(-1)),
+            (outputs[0], outputs[1].bfloat16()),
+            (outputs[0], outputs[1].transpose(1, 2)),
+            overlapping,
+        ):
+            with (
+                self.subTest(destinations=destinations),
+                self.assertRaises(RuntimeError),
+            ):
+                _validate_external_wgrad_destinations(
+                    destinations,
+                    weights,
+                    torch.float32,
+                )
+        with self.assertRaisesRegex(RuntimeError, "overlap"):
+            _validate_external_wgrad_destinations(
+                outputs, weights, torch.float32, (outputs[0].view(torch.uint8),)
+            )
+        for output in (*outputs, shared):
+            self.assertTrue(torch.all(output == 1).item())
+
     def _run_fake_residual_chain(
         self,
         config: dist_moe.Config,
@@ -2184,6 +2380,8 @@ class DistMoeKernelTest(unittest.TestCase):
         swiglu_limit: float = 7.0,
         inference: bool = True,
         block_scaled: dist_moe.BlockScaledConfig | None = None,
+        wgrad_dtype: torch.dtype | None = None,
+        activation_slot_capacity_factor: float = 1.0,
     ) -> tuple:
         """Create two input sets and one standalone DistMoE context.
 
@@ -2197,6 +2395,8 @@ class DistMoeKernelTest(unittest.TestCase):
             swiglu_limit: Preactivation bound for clamped SwiGLU.
             inference: Whether to create a scratch-only inference context.
             block_scaled: Optional block-scaled execution policy.
+            wgrad_dtype: Optional kernel gradient output precision.
+            activation_slot_capacity_factor: Saved-activation budget; zero forces recompute.
 
         Returns:
             dist_moe.Context, two ``(x, topk_ids, topk_scores)`` tuples, and the two
@@ -2253,17 +2453,295 @@ class DistMoeKernelTest(unittest.TestCase):
                 num_experts=num_experts,
                 max_moe_layers_per_activation_slot=max_moe_layers_per_activation_slot,
                 device_scratch_capacity_factor=1.0,
-                activation_slot_capacity_factor=(None if inference else 1.0),
+                activation_slot_capacity_factor=(
+                    None if inference else activation_slot_capacity_factor
+                ),
                 num_activation_slots=0 if inference else num_activation_slots,
                 block_scaled=block_scaled,
                 activation=activation,
                 swiglu_alpha=swiglu_alpha,
                 swiglu_limit=swiglu_limit,
                 inference=inference,
+                wgrad_dtype=wgrad_dtype,
             ),
         )
         self.addCleanup(context.close)
         return context, (x_a, ids_a, scores_a), (x_b, ids_b, scores_b), w13, w2
+
+    def test_imported_mxfp8_uses_independent_dgrad_payload(self) -> None:
+        """DGRAD-only changes affect dX, while FPROP changes affect Y.
+
+        Zeroing only W13 DGRAD proves its independent storage is consumed, rather
+        than sharing a faulty reference. Y, dScores and both WGRADs must remain
+        bitwise unchanged. Both pipelines exercise saved and recomputed state.
+        """
+        from dist_moe._quantization import quantize_for_format
+
+        for pipeline in ("staged", "mega"):
+            for saved_factor in (0.0, 1.0):
+                with self.subTest(pipeline=pipeline, saved_factor=saved_factor):
+                    policy = dist_moe.BlockScaledConfig(pipeline=pipeline)
+                    context, case, _, w13, w2 = self._create_case(
+                        inference=False,
+                        block_scaled=policy,
+                        activation_slot_capacity_factor=saved_factor,
+                    )
+                    weights = (w13.requires_grad_(), w2.requires_grad_())
+                    payloads = []
+                    for weight in weights:
+                        (column, column_scale), (row, row_scale) = quantize_for_format(
+                            weight.detach(),
+                            _KernelBlockScaledFormat.MXFP8_E4M3,
+                            block_size=((32, 1), (1, 32)),
+                        )
+                        payloads.append(
+                            dict(
+                                source=weight,
+                                format=policy.format,
+                                fprop_data=row,
+                                fprop_scale=row_scale,
+                                dgrad_data=column.transpose(1, 2).contiguous(),
+                                dgrad_scale=column_scale,
+                            )
+                        )
+                    dy = torch.randn_like(case[0])
+
+                    def run(operands, *, explicit=True):
+                        """Run prepared-only math; any hidden weight preparation fails."""
+                        for weight in weights:
+                            weight.grad = None
+                        x = case[0].detach().clone().requires_grad_()
+                        scores = case[2].detach().clone().requires_grad_()
+                        with mock.patch.object(
+                            blockscaled_impl,
+                            "_prepare_mxfp8_weight_op",
+                            side_effect=AssertionError("import must not requantize"),
+                        ):
+                            prepared = tuple(
+                                dist_moe.import_block_scaled_weight(**args)
+                                for args in operands
+                            )
+                            if explicit:
+                                y, state = dist_moe.functional.forward(
+                                    x, case[1], scores, *prepared, context
+                                )
+                                outputs = tuple(
+                                    torch.zeros_like(weight) for weight in weights
+                                )
+                                dx, dscores = dist_moe.functional.backward(
+                                    state, dy, grad_w13=outputs[0], grad_w2=outputs[1]
+                                )
+                                return (y, dx, dscores, *outputs)
+                            y = dist_moe.routed_experts(
+                                x, case[1], scores, *prepared, context
+                            )
+                            y.backward(dy)
+                        return (
+                            y.detach(),
+                            x.grad,
+                            scores.grad,
+                            *(weight.grad.clone() for weight in weights),
+                        )
+
+                    expected = run(payloads, explicit=False)
+                    for value, target in zip(run(payloads), expected, strict=True):
+                        torch.testing.assert_close(value, target, rtol=0, atol=0)
+                    zero_dgrad = dict(
+                        payloads[0],
+                        dgrad_data=torch.zeros_like(payloads[0]["dgrad_data"]),
+                    )
+                    actual = run((zero_dgrad, payloads[1]))
+                    self.assertGreater(torch.count_nonzero(expected[1]).item(), 0)
+                    self.assertEqual(torch.count_nonzero(actual[1]).item(), 0)
+                    for index in (0, 2, 3, 4):
+                        torch.testing.assert_close(
+                            actual[index], expected[index], rtol=0, atol=0
+                        )
+                    zero_w2_dgrad = dict(
+                        payloads[1],
+                        dgrad_data=torch.zeros_like(payloads[1]["dgrad_data"]),
+                    )
+                    upstream = run((payloads[0], zero_w2_dgrad))
+                    self.assertEqual(torch.count_nonzero(upstream[1]).item(), 0)
+                    self.assertEqual(torch.count_nonzero(upstream[3]).item(), 0)
+                    for index in (0, 2, 4):
+                        torch.testing.assert_close(
+                            upstream[index], expected[index], rtol=0, atol=0
+                        )
+                    zero_fprop = dict(
+                        payloads[0],
+                        fprop_data=torch.zeros_like(payloads[0]["fprop_data"]),
+                    )
+                    modified = run((zero_fprop, payloads[1]))
+                    self.assertGreater(torch.count_nonzero(expected[0]).item(), 0)
+                    self.assertEqual(torch.count_nonzero(modified[0]).item(), 0)
+                    context.close()
+
+    def test_functional_accumulation_and_multiple_live_forwards(self) -> None:
+        """Explicit state accumulates two reverse-order frames without owner hooks.
+
+        Native autograd supplies same-operand targets. Nonzero buffers test
+        accumulation; graph replay and changed inputs test captured addresses.
+        Both MXFP8 pipelines consume independent imported directional payloads.
+        """
+        from dist_moe._quantization import quantize_for_format
+
+        for policy, saved_factor in itertools.product(
+            (
+                None,
+                dist_moe.BlockScaledConfig(pipeline="staged"),
+                dist_moe.BlockScaledConfig(pipeline="mega"),
+            ),
+            (0.0, 1.0),
+        ):
+            with self.subTest(policy=policy, saved_factor=saved_factor):
+                context, case_a, case_b, w13, w2 = self._create_case(
+                    inference=False,
+                    block_scaled=policy,
+                    max_moe_layers_per_activation_slot=2,
+                    wgrad_dtype=torch.float32,
+                    activation_slot_capacity_factor=saved_factor,
+                )
+                owners = tuple(torch.nn.Parameter(weight) for weight in (w13, w2))
+                payloads = []
+                for owner in owners:
+                    if policy is None:
+                        payloads.append(owner.detach())
+                        continue
+                    (column, column_scale), (row, row_scale) = quantize_for_format(
+                        owner.detach(),
+                        _KernelBlockScaledFormat.MXFP8_E4M3,
+                        block_size=((32, 1), (1, 32)),
+                    )
+                    column = column.transpose(1, 2).contiguous()
+                    self.assertFalse(
+                        torch.equal(row.view(torch.uint8), column.view(torch.uint8))
+                    )
+                    payloads.append(
+                        dist_moe.import_block_scaled_weight(
+                            source=owner.detach(),
+                            format=policy.format,
+                            fprop_data=row,
+                            fprop_scale=row_scale,
+                            dgrad_data=column,
+                            dgrad_scale=column_scale,
+                        )
+                    )
+                dy = torch.randn_like(case_a[0])
+                expected = []
+                for case in (case_a, case_b):
+                    context.select_activation_slot(0, 1)
+                    x, ids, scores = case
+                    x = x.detach().clone().requires_grad_()
+                    scores = scores.detach().clone().requires_grad_()
+                    reference_weights = tuple(
+                        owner.detach().clone().requires_grad_() for owner in owners
+                    )
+                    for weight in reference_weights:
+                        weight.grad_dtype = torch.float32
+                    reference_payloads = tuple(
+                        weight if policy is None else payload._with_source(weight)
+                        for weight, payload in zip(
+                            reference_weights, payloads, strict=True
+                        )
+                    )
+                    y = dist_moe.routed_experts(
+                        x, ids, scores, *reference_payloads, context
+                    )
+                    y.backward(dy)
+                    expected.append(
+                        (
+                            y.detach(),
+                            x.grad,
+                            scores.grad,
+                            *(weight.grad for weight in reference_weights),
+                        )
+                    )
+                destinations = tuple(
+                    torch.full_like(owner, 0.125, dtype=torch.float32)
+                    for owner in owners
+                )
+                initial = tuple(value.clone() for value in destinations)
+                context.select_activation_slot(0, 2)
+                actual = []
+                for x, ids, scores in (case_a, case_b):
+                    x = x.detach().clone().requires_grad_()
+                    scores = scores.detach().clone().requires_grad_()
+                    y, state = dist_moe.functional.forward(
+                        x, ids, scores, *payloads, context
+                    )
+                    self.assertFalse(y.requires_grad)
+                    actual.append((y, state, x, scores))
+                # A rejected destination must leave both buffers and the live
+                # state usable by the subsequent valid backward.
+                with self.assertRaises(RuntimeError):
+                    dist_moe.functional.backward(
+                        actual[-1][1],
+                        dy,
+                        grad_w13=destinations[0],
+                        grad_w2=destinations[1].view(-1),
+                    )
+                for value, target in zip(destinations, initial, strict=True):
+                    torch.testing.assert_close(value, target, rtol=0, atol=0)
+                recorder = _BackwardOpRecorder()
+                gradients = []
+                with recorder:
+                    for _, state, _, _ in reversed(actual):
+                        gradients.append(
+                            dist_moe.functional.backward(
+                                state,
+                                dy,
+                                grad_w13=destinations[0],
+                                grad_w2=destinations[1],
+                            )
+                        )
+                self.assertEqual(len(recorder.calls), 2)
+                for case, gradient, reference in zip(
+                    actual, reversed(gradients), expected, strict=True
+                ):
+                    for value, target in zip(
+                        (case[0], *gradient), reference[:3], strict=True
+                    ):
+                        torch.testing.assert_close(value, target, rtol=0, atol=0)
+                    self.assertIsNone(case[2].grad)
+                    self.assertIsNone(case[3].grad)
+                    self.assertEqual(
+                        set(case[1].metadata), {"need_recompute", "padded_receive_rows"}
+                    )
+                    with self.assertRaises(TypeError):
+                        case[1].metadata["other"] = dy
+                with self.assertRaisesRegex(RuntimeError, "consumes each state once"):
+                    dist_moe.functional.backward(
+                        actual[0][1],
+                        dy,
+                        grad_w13=destinations[0],
+                        grad_w2=destinations[1],
+                    )
+                for index, destination in enumerate(destinations):
+                    target = (
+                        initial[index] + expected[1][3 + index] + expected[0][3 + index]
+                    )
+                    torch.testing.assert_close(
+                        destination, target, rtol=1e-5, atol=1e-5
+                    )
+                    self.assertTrue(
+                        all(
+                            call[index].data_ptr() == destination.data_ptr()
+                            for call in recorder.calls
+                        )
+                    )
+                self.assertTrue(all(owner.grad is None for owner in owners))
+                context.select_activation_slot(0, 1)
+                output, state = dist_moe.functional.forward(
+                    *case_a, *payloads, context, save_for_backward=False
+                )
+                self.assertIsNone(state)
+                self.assertFalse(output.requires_grad)
+                torch.testing.assert_close(output, expected[0][0], rtol=0, atol=0)
+                _assert_functional_graph(
+                    self, context, case_a, tuple(payloads), dy, expected[0]
+                )
+                context.close()
 
     def test_context_accepts_bounded_token_shapes(self) -> None:
         """Reuse one training context from one row through its capacity."""
@@ -4539,6 +5017,33 @@ class DistMoeTwoRankTest(unittest.TestCase):
         return "cuda"
 
     @with_comms
+    def test_functional_bf16_matches_native_and_graph_over_peers(self) -> None:
+        """Real peer BF16 explicit/graph gradients match native-autograd exactly."""
+        self._run_two_rank_numerics(
+            None, functional_execution=True, parameter_grad_dtype=torch.float32
+        )
+
+    @with_comms
+    def test_functional_mxfp8_staged_matches_native_and_graph_over_peers(self) -> None:
+        """Prepared MXFP8 staged explicit/graph math matches native over peers."""
+        self._run_two_rank_numerics(
+            dist_moe.BlockScaledConfig(pipeline="staged"),
+            prepared_weights=True,
+            functional_execution=True,
+            parameter_grad_dtype=torch.float32,
+        )
+
+    @with_comms
+    def test_functional_mxfp8_mega_matches_native_and_graph_over_peers(self) -> None:
+        """Prepared MXFP8 mega explicit/graph math matches native over peers."""
+        self._run_two_rank_numerics(
+            dist_moe.BlockScaledConfig(pipeline="mega"),
+            prepared_weights=True,
+            functional_execution=True,
+            parameter_grad_dtype=torch.float32,
+        )
+
+    @with_comms
     def test_dtensor_gradient_owner_resolves_local_storage(self) -> None:
         """Use FP32 DTensor-local storage for a BF16 parameter WGRAD."""
         device = torch.device("cuda", dist.get_rank())
@@ -4605,6 +5110,7 @@ class DistMoeTwoRankTest(unittest.TestCase):
         inference: bool = False,
         fuse_swiglu: bool = False,
         weight_block_size: Literal["1x32", "32x32"] | None = None,
+        functional_execution: bool = False,
     ) -> None:
         """Run one precision through real peer dispatch and combine paths.
 
@@ -4629,6 +5135,8 @@ class DistMoeTwoRankTest(unittest.TestCase):
             inference: Whether to exercise forward-only MXFP8 execution.
             fuse_swiglu: Whether to interleave prepared inference W13.
             weight_block_size: Optional MXFP8 inference quantization grain.
+            functional_execution: Compare explicit accumulation and graph replay
+                with the same native-autograd peer result.
         """
         rank = dist.get_rank()
         device = torch.device("cuda", rank)
@@ -4897,6 +5405,15 @@ class DistMoeTwoRankTest(unittest.TestCase):
                     _cosine_similarity(actual_grad, expected_grad),
                     cosine,
                     f"{name} cosine similarity",
+                )
+            if functional_execution:
+                _assert_functional_graph(
+                    self,
+                    context,
+                    (x, ids, scores),
+                    (call_w13, call_w2),
+                    grad_output,
+                    (actual.detach(), x.grad, scores.grad, w13.grad, w2.grad),
                 )
             if accumulate_execution:
                 self.assertEqual(hook_counts, {"w13": 1, "w2": 1})

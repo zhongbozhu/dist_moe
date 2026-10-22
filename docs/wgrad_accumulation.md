@@ -183,10 +183,18 @@ The standard path does not support:
 <a id="integrate-an-external-gradient-buffer"></a>
 ## Integrate an external gradient buffer
 
-Some frameworks attach a separate gradient buffer to each parameter. Megatron
-Core 0.14, for example, documents a distributed-optimizer `main_grad`
-contract. This is a framework-level ownership protocol, not a property of the
-Dist-MoE kernels.
+Use [explicit execution](functional_execution.md) when a caller owns complete
+local gradient buffers. `functional.forward` returns detached output and opaque
+state; `functional.backward` consumes the state and accumulates into two
+explicit destinations. Both buffers are validated before either is written,
+including overlap with saved operands. The same registered accumulating
+kernels serve BF16 and prepared MXFP8 execution.
+
+The caller owns parameter edges, hooks, zeroing, reductions, and optimizer
+lifetimes. No owner protocol or completion callback crosses this API. CUDA
+capture uses the same calls; replay executes only captured device work.
+
+The native autograd entry point also supports an eager destination callback:
 
 An integration that owns the complete lifecycle may provide
 `wgrad_destination_fn`. Immediately before W13 or W2 WGRAD, Dist-MoE passes

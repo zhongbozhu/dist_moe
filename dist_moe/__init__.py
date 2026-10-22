@@ -14,6 +14,7 @@ from .api import (
     Config,
     Context,
     create_context,
+    import_block_scaled_weight,
     ExecutionOptions,
     MemoryPlan,
     plan_memory,
@@ -24,6 +25,8 @@ from .api import (
     supports_fused_post_expert_rmsnorm,
     VmmConfig,
 )
+
+from . import functional
 
 __all__ = [
     "Bf16GroupedGemmPreset",
@@ -38,6 +41,8 @@ __all__ = [
     "RMSNormPostprocess",
     "VmmConfig",
     "create_context",
+    "functional",
+    "import_block_scaled_weight",
     "plan_memory",
     "prepare_block_scaled_weight",
     "routed_experts",

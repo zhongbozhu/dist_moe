@@ -2978,6 +2978,58 @@ def _prepare_mxfp8_weight_fake(
     )
 
 
+def _import_block_scaled_weight(
+    *,
+    source: torch.Tensor,
+    format: Any,
+    fprop_data: torch.Tensor,
+    fprop_scale: torch.Tensor,
+    dgrad_data: torch.Tensor,
+    dgrad_scale: torch.Tensor,
+) -> PreparedWeight:
+    """Validate and borrow external canonical MXFP8 training storage.
+
+    The public factory documents layouts and caller ownership. This performs
+    metadata checks only; both quantization directions remain independent.
+    """
+    from ._execution import BlockScaledFormat as PublicFormat, PreparedWeight
+
+    if format != PublicFormat.MXFP8_E4M3:
+        raise ValueError("import supports canonical MXFP8 training operands only")
+    _validate_mxfp8_weight_shape(source)
+    if source.device.type != "cuda" or source.dtype != torch.bfloat16:
+        raise ValueError("source must be a logical CUDA BF16 weight")
+    groups, rows, cols = source.shape
+    if min(groups, rows, cols) <= 0:
+        raise ValueError("imported weight dimensions must be positive")
+    specifications = (
+        ("fprop_data", fprop_data, source.shape, torch.float8_e4m3fn),
+        ("dgrad_data", dgrad_data, source.shape, torch.float8_e4m3fn),
+        ("fprop_scale", fprop_scale, (groups * rows, cols // 32), torch.float8_e8m0fnu),
+        ("dgrad_scale", dgrad_scale, (groups * cols, rows // 32), torch.float8_e8m0fnu),
+    )
+    for name, operand, shape, dtype in specifications:
+        if (
+            operand.shape != shape
+            or operand.dtype != dtype
+            or operand.device != source.device
+            or not operand.is_contiguous()
+            or operand.storage_offset() * operand.element_size() % 16
+        ):
+            raise ValueError(
+                f"{name} must have matching shape, dtype, device and aligned contiguous storage"
+            )
+    return PreparedWeight._create(
+        source=source,
+        format=PublicFormat.MXFP8_E4M3,
+        fprop_data=fprop_data,
+        fprop_scale=fprop_scale,
+        dgrad_data=dgrad_data,
+        dgrad_scale=dgrad_scale,
+        external_operands=True,
+    )
+
+
 def _prepare_blockscaled_weight(  # noqa: C901 -- preparation modes share one ownership contract
     weight: torch.Tensor,
     config: BlockScaledConfig,
@@ -3026,6 +3078,10 @@ def _prepare_blockscaled_weight(  # noqa: C901 -- preparation modes share one ow
     if fuse_swiglu and weight.shape[1] % 16:
         raise ValueError("fused inference W13 requires F divisible by eight")
     if out is not None:
+        if out._external_operands:
+            raise ValueError(
+                "externally imported operands must be refreshed by their owner"
+            )
         if inference or kernel_format != BlockScaledFormat.MXFP8_E4M3:
             raise ValueError("caller-owned refill supports MXFP8 training weights")
         if out.format != config.format:
@@ -3741,8 +3797,11 @@ def _run_block_scaled_registered_backward(
     )
     weights: list[torch.Tensor | None] = list(state[_BACKWARD_WEIGHT_STATE])
     if kernel_format not in FP4_FORMATS:
-        weights[2] = weights[0]
-        weights[7] = weights[5]
+        # Dynamic 32x32 preparation omits duplicate qdata in registered state.
+        # Imported 1D operands retain independently quantized DGRAD data.
+        for fprop_index, dgrad_index in ((0, 2), (5, 7)):
+            if weights[dgrad_index].numel() == 0:
+                weights[dgrad_index] = weights[fprop_index]
     assert weights[4] is not None and weights[9] is not None
     weights[4] = _optional_state(weights[4])
     weights[9] = _optional_state(weights[9])
@@ -4376,7 +4435,10 @@ class _RegisteredBlockScaledAutograd(torch.autograd.Function):
             Gradients aligned with the forward arguments.
         """
         (grad_output_TD,) = grad_outputs
-        return _block_scaled_autograd_backward(ctx, grad_output_TD, None)
+        raw = _block_scaled_autograd_backward(ctx, grad_output_TD, None)
+        gradients = [None] * len(ctx.needs_input_grad)
+        gradients[:5] = raw[:5]
+        return tuple(gradients)
 
 
 def _run_blockscaled(  # noqa: C901 -- validate and dispatch one public execution contract

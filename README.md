@@ -725,10 +725,12 @@ device capacity may use host backing. See [VMM host-backed scratch](docs/vmm.md)
 | [`dist_moe.BlockScaledConfig`](docs/mxfp8_execution.md) | Block-scaled precision and staged/Mega pipeline policy |
 | [`dist_moe.BlockScaledKernelConfig`](docs/mxfp8_execution.md) | Expert-only complete CuTe launch override |
 | [`dist_moe.ExecutionOptions`](docs/wgrad_accumulation.md) | Per-call accumulation, postprocess, observer, and callback controls |
+| [`dist_moe.functional`](docs/functional_execution.md) | Explicit forward/backward with external gradient accumulation |
 | [`dist_moe.RMSNormPostprocess`](docs/postprocess.md) | Typed fused post-expert RMSNorm policy |
 | [`dist_moe.MemoryPlan`](docs/memory_planner.md) / [`dist_moe.plan_memory`](docs/memory_planner.md) | Immutable memory plan and pure planning function |
 | [`dist_moe.Context`](docs/bf16_execution.md) / [`dist_moe.create_context`](docs/bf16_execution.md) | Reusable distributed runtime state and collective factory |
 | [`dist_moe.PreparedWeight`](docs/mxfp8_execution.md) / [`dist_moe.prepare_block_scaled_weight`](docs/mxfp8_execution.md) | Caller-owned block-scaled weight storage and preparation |
+| [`dist_moe.import_block_scaled_weight`](docs/mxfp8_execution.md) | Borrow independent canonical MXFP8 operands without quantizing or copying |
 | [`dist_moe.routed_experts`](docs/bf16_execution.md) | BF16/MXFP8 training or BF16/MXFP8/NVFP4 inference |
 | [`dist_moe.supports_fused_post_expert_rmsnorm`](docs/postprocess.md) | Query fused RMSNorm shape/dtype support |
 

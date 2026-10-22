@@ -71,6 +71,10 @@ class _KernelAutogradContext:
         """
         self.saved_tensors = tensors
 
+    def set_materialize_grads(self, value: bool) -> None:
+        """Accept registered setup metadata without creating autograd edges."""
+        del value
+
     def mark_non_differentiable(self, *tensors: torch.Tensor) -> None:
         """Accept the inference-only autograd context operation.
 
@@ -260,8 +264,9 @@ class PreparedWeight:
             E4M3 values; NVFP4 stores two packed E2M1 values per byte.
         fprop_scale: Contiguous CUDA scale storage in the blocked layout
             consumed directly by the FPROP kernel.
-        dgrad_data: Contiguous transposed MXFP8 E4M3 DGRAD qdata. It is required
-            for MXFP8 training and absent for inference-only NVFP4.
+        dgrad_data: Contiguous MXFP8 E4M3 DGRAD qdata in the same logical
+            ``[E, N, K]`` shape as FPROP, independently quantized or shared.
+            Consumers transpose it. Required for MXFP8 training, absent for NVFP4.
         dgrad_scale: Contiguous blocked DGRAD scales with the orientation
             matching ``dgrad_data``; absent for NVFP4.
         global_scale: Optional per-expert FP32 global scale required by NVFP4.
@@ -279,14 +284,17 @@ class PreparedWeight:
     global_scale: torch.Tensor | None = None
     global_scale_inv: torch.Tensor | None = None
     _interleaved_fc13: bool = False
+    _external_operands: bool = False
 
     def __init__(self) -> None:
-        """Reject construction outside :func:`prepare_block_scaled_weight`.
+        """Reject construction outside the preparation and import factories.
 
         Raises:
             TypeError: Always. The factory validates all layouts together.
         """
-        raise TypeError("use prepare_block_scaled_weight()")
+        raise TypeError(
+            "use prepare_block_scaled_weight() or import_block_scaled_weight()"
+        )
 
     @classmethod
     def _create(
@@ -301,6 +309,7 @@ class PreparedWeight:
         global_scale: torch.Tensor | None = None,
         global_scale_inv: torch.Tensor | None = None,
         interleaved_fc13: bool = False,
+        external_operands: bool = False,
     ) -> PreparedWeight:
         """Construct one validated prepared-weight owner.
 
@@ -317,6 +326,7 @@ class PreparedWeight:
             global_scale_inv: Optional reciprocal global scale.
             interleaved_fc13: Whether FPROP rows contain adjacent gate/up
                 groups for the inference-only fused SwiGLU kernels.
+            external_operands: Whether an external quantizer owns operand updates.
 
         Returns:
             Factory-owned prepared-weight state.
@@ -332,6 +342,7 @@ class PreparedWeight:
             ("global_scale", global_scale),
             ("global_scale_inv", global_scale_inv),
             ("_interleaved_fc13", interleaved_fc13),
+            ("_external_operands", external_operands),
         ):
             object.__setattr__(prepared, name, value)
         return prepared
@@ -379,6 +390,7 @@ class PreparedWeight:
             global_scale=self.global_scale,
             global_scale_inv=self.global_scale_inv,
             interleaved_fc13=self._interleaved_fc13,
+            external_operands=self._external_operands,
         )
 
 
@@ -681,6 +693,47 @@ def _wgrad_accumulation_destinations(
     if destinations[0].dtype != destinations[1].dtype:
         raise RuntimeError("W13 and W2 accumulators have different WGRAD dtypes")
     return destinations
+
+
+def _validate_external_wgrad_destinations(
+    outputs: tuple[torch.Tensor, torch.Tensor],
+    weights: tuple[torch.Tensor, torch.Tensor],
+    output_dtype: torch.dtype,
+    payloads: tuple[torch.Tensor, ...] = (),
+) -> None:
+    """Validate external accumulating destinations before either kernel writes.
+
+    Args:
+        outputs: Caller-owned contiguous grouped W13/W2 gradients.
+        weights: Grouped logical weights defining shapes and devices.
+        output_dtype: Common BF16 or FP32 gradient dtype.
+        payloads: Borrowed operands that must not overlap either destination.
+
+    Raises:
+        RuntimeError: If metadata or disjoint-storage requirements are violated.
+    """
+    if output_dtype not in (torch.bfloat16, torch.float32):
+        raise RuntimeError("external WGRAD destinations require BF16 or FP32")
+    for output in outputs:
+        if output.device.type != "cuda" or output.requires_grad:
+            raise RuntimeError(
+                "WGRAD destinations must be non-differentiable CUDA tensors"
+            )
+    _wgrad_accumulation_destinations(*outputs, *weights, output_dtype)
+    # Destinations are contiguous. Byte intervals permit disjoint views of one
+    # framework gradient buffer while rejecting partial aliases before writes.
+    ranges = [
+        (tensor.data_ptr(), tensor.data_ptr() + tensor.numel() * tensor.element_size())
+        for tensor in (*outputs, *payloads)
+    ]
+    for index, (start, end) in enumerate(ranges[:2]):
+        if any(
+            start < other_end and other_start < end
+            for other_start, other_end in ranges[index + 1 :]
+        ):
+            raise RuntimeError(
+                "WGRAD destinations must not overlap each other or saved operands"
+            )
 
 
 def _resolve_wgrad_destination(

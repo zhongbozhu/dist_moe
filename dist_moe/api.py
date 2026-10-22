@@ -90,6 +90,7 @@ __all__ = [
     "PreparedWeight",
     "VmmConfig",
     "create_context",
+    "import_block_scaled_weight",
     "plan_memory",
     "prepare_block_scaled_weight",
     "RMSNormPostprocess",
@@ -3622,12 +3623,9 @@ def _bf16_autograd_backward(
         ctx.saved_tensors
     )
     inplace_wgrad_accum = getattr(ctx, "inplace_wgrad_accum", False)
-    w13_compute_EFD = (
-        w13_EFD.view(ctx.w13_compute_shape) if inplace_wgrad_accum else w13_EFD
-    )
-    w2_compute_EDF = (
-        w2_EDF.view(ctx.w2_compute_shape) if inplace_wgrad_accum else w2_EDF
-    )
+    grouped = inplace_wgrad_accum
+    w13_compute_EFD = w13_EFD.view(ctx.w13_compute_shape) if grouped else w13_EFD
+    w2_compute_EDF = w2_EDF.view(ctx.w2_compute_shape) if grouped else w2_EDF
     context = _get_context(ctx.context_id)
     wgrad_destinations = None
     if inplace_wgrad_accum:
@@ -3779,26 +3777,28 @@ class _RegisteredBf16Autograd(torch.autograd.Function):
                 w2_EDF,
                 context,
             )
-            owners = options.wgrad_parameter_owners
             ctx.w13_input_shape = w13_EFD.shape
             ctx.w2_input_shape = w2_EDF.shape
             ctx.w13_compute_shape = w13_compute_EFD.shape
             ctx.w2_compute_shape = w2_compute_EDF.shape
-            ctx.w13_param_ref = _weak_parameter_ref(
-                w13_EFD,
-                None if owners is None else owners[0],
-            )
-            ctx.w2_param_ref = _weak_parameter_ref(
-                w2_EDF,
-                None if owners is None else owners[1],
-            )
+            if options.inplace_wgrad_accum:
+                owners = options.wgrad_parameter_owners
+                ctx.w13_param_ref = _weak_parameter_ref(
+                    w13_EFD, None if owners is None else owners[0]
+                )
+                ctx.w2_param_ref = _weak_parameter_ref(
+                    w2_EDF, None if owners is None else owners[1]
+                )
         return output[0]
 
     @staticmethod
     def backward(ctx: Any, *grad_outputs: torch.Tensor) -> tuple[Any, ...]:
         """Run the registered functional or accumulating BF16 backward."""
         (grad_output_TD,) = grad_outputs
-        return (*_bf16_autograd_backward(ctx, grad_output_TD, None), None, None, None)
+        raw = _bf16_autograd_backward(ctx, grad_output_TD, None)
+        gradients = [None] * len(ctx.needs_input_grad)
+        gradients[:5] = raw[:5]
+        return tuple(gradients)
 
 
 _bf16_forward_op.register_autograd(
@@ -3851,6 +3851,70 @@ _bf16_forward_with_clip_stats_op.register_autograd(
     _bf16_clip_autograd_backward,
     setup_context=_bf16_clip_setup_context,
 )
+
+
+def _prepare_execution_inputs(
+    x_TD: torch.Tensor,
+    topk_expert_ids_TK: torch.Tensor,
+    topk_scores_TK: torch.Tensor,
+    w13_weight: torch.Tensor | PreparedWeight,
+    w2_weight: torch.Tensor | PreparedWeight,
+    context: Context,
+    options: ExecutionOptions | None,
+) -> tuple[ExecutionOptions, torch.Tensor, torch.Tensor]:
+    """Validate common routing, weight, and observability metadata before dispatch."""
+    options = _resolve_execution_options(options)
+    clip_stats_out_3 = options.swiglu_clip_stats_out_3
+    if clip_stats_out_3 is not None:
+        if clip_stats_out_3.device != x_TD.device:
+            raise ValueError(
+                "swiglu_clip_stats_out_3 must be on the Dist-MoE input device"
+            )
+        if context.config.block_scaled is not None:
+            raise ValueError("SwiGLU clip statistics are supported only by BF16")
+    _validate_routing_shape(
+        x_TD,
+        topk_expert_ids_TK,
+        topk_scores_TK,
+        context,
+    )
+    prepared = isinstance(w13_weight, PreparedWeight) or isinstance(
+        w2_weight, PreparedWeight
+    )
+    if prepared and not (
+        isinstance(w13_weight, PreparedWeight) and isinstance(w2_weight, PreparedWeight)
+    ):
+        raise TypeError(
+            "w13_weight and w2_weight must either both be prepared or both be tensors"
+        )
+    if prepared:
+        if context.config.block_scaled is None:
+            raise ValueError("prepared weights require block-scaled execution")
+        if options.weights_preprocess_fn is not None:
+            raise ValueError(
+                "prepared weights cannot be combined with weights_preprocess_fn"
+            )
+        assert isinstance(w13_weight, PreparedWeight)
+        assert isinstance(w2_weight, PreparedWeight)
+        w13_EFD, w2_EDF = _reshape_weights(
+            w13_weight.source,
+            w2_weight.source,
+            context,
+        )
+    else:
+        assert isinstance(w13_weight, torch.Tensor)
+        assert isinstance(w2_weight, torch.Tensor)
+        w13_EFD, w2_EDF = _reshape_weights(w13_weight, w2_weight, context)
+    if options.weights_preprocess_fn is None and not prepared:
+        _validate_inputs(
+            x_TD,
+            topk_expert_ids_TK,
+            topk_scores_TK,
+            w13_EFD,
+            w2_EDF,
+            context,
+        )
+    return options, w13_EFD, w2_EDF
 
 
 def routed_experts(  # noqa: C901
@@ -3925,59 +3989,19 @@ def routed_experts(  # noqa: C901
         RuntimeError: If gradients are requested from an inference context.
 
     """
-    options = _resolve_execution_options(options)
-    clip_stats_out_3 = options.swiglu_clip_stats_out_3
-    if clip_stats_out_3 is not None:
-        if clip_stats_out_3.device != x_TD.device:
-            raise ValueError(
-                "swiglu_clip_stats_out_3 must be on the Dist-MoE input device"
-            )
-        if context.config.block_scaled is not None:
-            raise ValueError("SwiGLU clip statistics are supported only by BF16")
-    _validate_routing_shape(
+    options, w13_EFD, w2_EDF = _prepare_execution_inputs(
         x_TD,
         topk_expert_ids_TK,
         topk_scores_TK,
+        w13_weight,
+        w2_weight,
         context,
+        options,
     )
-    prepared = isinstance(w13_weight, PreparedWeight) or isinstance(
-        w2_weight, PreparedWeight
-    )
-    if prepared and not (
-        isinstance(w13_weight, PreparedWeight) and isinstance(w2_weight, PreparedWeight)
-    ):
-        raise TypeError(
-            "w13_weight and w2_weight must either both be prepared or both be tensors"
-        )
-    if prepared:
-        if context.config.block_scaled is None:
-            raise ValueError("prepared weights require block-scaled execution")
-        if options.weights_preprocess_fn is not None:
-            raise ValueError(
-                "prepared weights cannot be combined with weights_preprocess_fn"
-            )
-        assert isinstance(w13_weight, PreparedWeight)
-        assert isinstance(w2_weight, PreparedWeight)
-        w13_EFD, w2_EDF = _reshape_weights(
-            w13_weight.source,
-            w2_weight.source,
-            context,
-        )
-        logical_w13_weight = logical_w2_weight = None
-    else:
-        assert isinstance(w13_weight, torch.Tensor)
-        assert isinstance(w2_weight, torch.Tensor)
-        logical_w13_weight, logical_w2_weight = w13_weight, w2_weight
-        w13_EFD, w2_EDF = _reshape_weights(w13_weight, w2_weight, context)
-    if options.weights_preprocess_fn is None and not prepared:
-        _validate_inputs(
-            x_TD,
-            topk_expert_ids_TK,
-            topk_scores_TK,
-            w13_EFD,
-            w2_EDF,
-            context,
-        )
+    prepared = isinstance(w13_weight, PreparedWeight)
+    logical_w13_weight = None if prepared else w13_weight
+    logical_w2_weight = None if prepared else w2_weight
+    clip_stats_out_3 = options.swiglu_clip_stats_out_3
     postprocess = options.experts_output_postprocess
     rmsnorm_weight_D = (
         postprocess.weight if isinstance(postprocess, RMSNormPostprocess) else None
@@ -4109,6 +4133,53 @@ def routed_experts(  # noqa: C901
         options.swiglu_clip_limit,
         options.validate_expert_ids,
         context.context_id,
+    )
+
+
+def import_block_scaled_weight(
+    *,
+    source: torch.Tensor,
+    format: BlockScaledFormat,
+    fprop_data: torch.Tensor,
+    fprop_scale: torch.Tensor,
+    dgrad_data: torch.Tensor,
+    dgrad_scale: torch.Tensor,
+) -> PreparedWeight:
+    """Borrow canonical MXFP8 training operands without quantizing or copying.
+
+    Args:
+        source: Logical CUDA BF16 identity with shape ``[E, N, K]``; N and K
+            must be divisible by 128. Its storage is never read. Tensor
+            subclasses can provide this identity without a BF16 shadow.
+        format: Must be ``BlockScaledFormat.MXFP8_E4M3``.
+        fprop_data: Contiguous CUDA E4M3 data with shape ``[E, N, K]``.
+        fprop_scale: Contiguous E8M0 blocked scales with shape ``[E*N, K/32]``;
+            the natural grid before blocking is ``[E, N, K/32]``.
+        dgrad_data: Independent or shared E4M3 data, also ``[E, N, K]``.
+            Do not transpose its logical dimensions.
+        dgrad_scale: E8M0 blocked scales with shape ``[E*K, N/32]``; the natural
+            grid is ``[E, K, N/32]``. All operands share the source device.
+
+    Returns:
+        A wrapper aliasing every supplied tensor. The caller owns refresh and
+        must retain unchanged operands until all backward consumers finish.
+
+    Raises:
+        ValueError: If metadata does not meet the canonical training contract.
+
+    No collective or CUDA kernel is launched. This validates metadata, not
+    scale contents. NVFP4, inference interleaving, and preparation refill of
+    borrowed operands are unsupported.
+    """
+    from ._blockscaled import _import_block_scaled_weight
+
+    return _import_block_scaled_weight(
+        source=source,
+        format=format,
+        fprop_data=fprop_data,
+        fprop_scale=fprop_scale,
+        dgrad_data=dgrad_data,
+        dgrad_scale=dgrad_scale,
     )
 
 
